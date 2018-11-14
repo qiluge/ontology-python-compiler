@@ -9,6 +9,7 @@ from binascii import a2b_hex
 from ontology import __version__
 import json
 from ontology.code.StaticAppCall import RegisterAppCall, NotifyAction
+from ontology.code.astvmtoken import AstVMToken
 
 ONTOLOGY_SC_FRAMEWORK   = 'ontology.interop.'
 ONTOLOGY_BUILTINS_M     = 'ontology.builtins'
@@ -1350,6 +1351,160 @@ class CodeGenContext:
             out_file.write("")
         #print(ast.dump(self.main_astree))
 
+    def Fix_all_label_addr(self, insertaddr):
+        for label in range(len(self.labels)):
+            if self.labels[label] >= insertaddr:
+                self.labels[label] += 6
+
+    def Fix_all_vmtoken_addr(self, insertaddr):
+        all_token = self.tokenizer.vm_tokens.items()
+        for addr, vmtoken in all_token:
+            assert(addr == vmtoken.addr)
+            if addr >= insertaddr:
+                vmtoken.addr += 6
+
+    def Insert_token_at_addr(self, jmptoken, fixjmptoken, insertaddr):
+        vm_tokens = OrderedDict()
+        all_token = self.tokenizer.vm_tokens.items()
+        for index, vmtoken in all_token:
+            # due to already fixed
+            assert(index == vmtoken.addr or (index + 6) == vmtoken.addr)
+
+            if index == insertaddr:
+                vm_tokens[index] = fixjmptoken
+                vm_tokens[index + 3] = jmptoken
+                vm_tokens[index + 6] = vmtoken
+                assert(index == fixjmptoken.addr)
+                assert((index + 3) == jmptoken.addr)
+                assert((index + 6) == vmtoken.addr)
+            elif index < insertaddr:
+                vm_tokens[index] = vmtoken
+            else:
+                assert((index + 6) == vmtoken.addr)
+                vm_tokens[index + 6] = vmtoken 
+
+        self.tokenizer.vm_tokens = vm_tokens
+
+    def Find_insert_addr(self, insertaddr, bakend):
+        all_token = self.tokenizer.vm_tokens.items()
+        newinsertaddr = None
+
+        if bakend:
+            for addr, vmtoken in all_token:
+                assert(addr == vmtoken.addr)
+                if addr < insertaddr:
+                    newinsertaddr = addr
+                else:
+                    break
+        else:
+            for addr, vmtoken in all_token:
+                assert(addr == vmtoken.addr)
+                if addr < insertaddr:
+                    pass
+                else:
+                    newinsertaddr = addr
+                    break
+
+        assert(newinsertaddr != None)
+        return newinsertaddr
+
+    def Fix_long_jmp(self, oldjmptoken, bakend):
+        # can not add 32767 or -32768 is because may be some one will add some place. so the 32767 add one can not convert to 2 bytes. will be fixed again. so it is a dead loop. so better much less than 32767 or bigger than -32768
+        if bakend:
+            insertaddr = oldjmptoken.addr + 20000
+        else:
+            insertaddr = oldjmptoken.addr - 20000
+            assert(insertaddr >= 0)
+
+        target_label    = int.from_bytes(oldjmptoken.data, byteorder = 'little') 
+
+        insertaddr = self.Find_insert_addr(insertaddr, bakend)
+
+        # make a free space at insertaddr
+        self.Fix_all_label_addr(insertaddr)
+        self.Fix_all_vmtoken_addr(insertaddr)
+
+        # alloc new jmp token
+        fixjmptoken = AstVMToken(VMOp.JMP, oldjmptoken.node , insertaddr, oldjmptoken.cur_func, oldjmptoken.is_global, None)
+        newjmptoken = AstVMToken(VMOp.JMP, oldjmptoken.node , insertaddr + 3, oldjmptoken.cur_func, oldjmptoken.is_global, None)
+       
+        # assert new jmp label. and set at insertaddr
+        newjmplabel = self.NewLabel()
+        self.SetLabel(newjmplabel, insertaddr + 3)
+        newfixjmplabel = self.NewLabel()
+        self.SetLabel(newfixjmplabel, insertaddr + 6)
+        
+        # assert new jmp token jmp label is target_label data
+        newjmptoken.data    = oldjmptoken.data
+        newfixjmplabeldata  = newfixjmplabel.to_bytes(2, byteorder = 'little', signed = True) 
+        fixjmptoken.data    =  newfixjmplabeldata
+        if bakend:
+            target_addr     = self.labels[target_label]
+            assert(insertaddr < target_addr)
+        elif not bakend:
+            target_addr     = self.labels[target_label]
+            if insertaddr <= target_addr:
+                print(insertaddr)
+                print(target_addr)
+            assert(insertaddr > target_addr)
+        
+        # assert old jmp token data is newjmplabel 
+        newjmplabeldata = newjmplabel.to_bytes(2, byteorder = 'little', signed = True) 
+        oldjmptoken.data = newjmplabeldata
+        
+        # insert
+        self.Insert_token_at_addr(newjmptoken, fixjmptoken, insertaddr)
+        
+        assert((insertaddr) == fixjmptoken.addr)
+        assert((insertaddr + 3) == newjmptoken.addr)
+
+        # check offset ok.
+        target_addr     = self.labels[target_label]
+        newoffset = target_addr - (insertaddr + 3) 
+        if newoffset > 32767:
+            self.Fix_long_jmp(newjmptoken, True)
+        elif newoffset < -32768:
+            self.Fix_long_jmp(newjmptoken, False)
+    
+        return
+
+    def PreLinkProcess(self):
+        self.count_deep += 1
+        print("prelink------------------------------------------%d"%(self.count_deep))
+        all_token = self.tokenizer.vm_tokens.items()
+        print((len(all_token)))
+        link_op = [VMOp.JMP, VMOp.JMPIF, VMOp.JMPIFNOT, VMOp.CALL]
+        prev_addr = -1
+        fixed_long_jmp = False
+        test_count = 0
+        for addr, vmtoken in all_token:
+            if vmtoken.addr != addr:
+                print(addr, vmtoken.addr)
+            assert(vmtoken.addr == addr)
+            assert(prev_addr < addr)
+
+            if vmtoken.vm_op in link_op:
+                target_label    = int.from_bytes(vmtoken.data, byteorder = 'little') 
+                target_addr     = self.labels[target_label]
+                assert(target_addr != -1)
+                vmtoken.target  = target_addr
+                offset          = target_addr - vmtoken.addr
+                if offset > 32767 or offset < -32768:
+                    test_count += 1
+                    vmop_name = VMOp.to_name(vmtoken.out_op)
+                    if (type(vmop_name) == type(None)):
+                        vmop_name = 'PUSHBYTES' + str(vmtoken.out_op)
+                    print(vmop_name)
+
+                    fixed_long_jmp = True
+                    print("need re fixed addr %d" %(test_count))
+                    print(vmtoken.addr,target_addr ,offset)
+                    self.Fix_long_jmp(vmtoken, offset > 0)
+                    self.PreLinkProcess()
+                    return
+
+        prev_addr   = addr
+
     def LinkProcess(self):
         all_token = self.tokenizer.vm_tokens.items()
         link_op = [VMOp.JMP, VMOp.JMPIF, VMOp.JMPIFNOT, VMOp.CALL]
@@ -1364,7 +1519,10 @@ class CodeGenContext:
                 assert(target_addr != -1)
                 vmtoken.target  = target_addr
                 offset          = target_addr - vmtoken.addr
-                vmtoken.data    = offset.to_bytes(2, 'little', signed=True)
+                if offset <= 32767 and offset >= -32768:
+                    vmtoken.data    = offset.to_bytes(2, 'little', signed=True)
+                else:
+                    pass
 
         prev_addr   = addr
         self.write_code()
@@ -1575,6 +1733,8 @@ class CodeGenContext:
                 self.current_func_node = func_desc.func_ast
                 self.ConvertFuncDecl(func_desc)
 
+        self.count_deep = 0
+        self.PreLinkProcess()
         self.LinkProcess()
 
         #self.Dump_Asm()
