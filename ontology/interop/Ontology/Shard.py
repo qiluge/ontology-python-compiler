@@ -1,0 +1,2 @@
+def GetShardId():
+    pass

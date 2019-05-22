@@ -29,3 +29,12 @@ def Migrate(script, need_storage, name, version, author, email, description):
     :param description:
     """
     pass
+
+def InitMetaData(owner, allshard, isfrozen, shardid):
+    """
+    :param owner
+    :param allshard
+    :param isfrozen
+    :param shardid
+    """
+    pass
