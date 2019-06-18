@@ -40,3 +40,9 @@ def Deserialize(item):
     :param item:
     """
     pass
+
+def CheckShardCall(shardId):
+    """
+    :param hash_or_pubkey:
+    """
+    pass
